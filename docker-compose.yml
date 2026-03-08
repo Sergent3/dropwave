@@ -1,0 +1,31 @@
+services:
+  dropwave:
+    build: .
+    container_name: dropwave
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV:   production
+      PORT:       "3000"
+      # Set JWT_SECRET in a .env file or export it before running compose.
+      # docker compose will fail fast if this is missing.
+      JWT_SECRET: "${JWT_SECRET:?Set JWT_SECRET in .env or shell env}"
+      DB_PATH:    /app/data/users.db
+    volumes:
+      # Named volume so the SQLite database persists across container restarts
+      - dropwave_data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout:  5s
+      retries:  3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file:  "3"
+
+volumes:
+  dropwave_data:
