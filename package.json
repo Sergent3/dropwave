@@ -1,7 +1,7 @@
 {
   "name": "dropwave",
-  "version": "2.0.0",
-  "description": "P2P File Transfer via WebRTC — DropWave",
+  "version": "3.0.0",
+  "description": "WebSocket Relay File Transfer — DropWave",
   "main": "server.js",
   "engines": { "node": ">=18" },
   "scripts": {
@@ -9,12 +9,13 @@
     "dev":   "nodemon server.js"
   },
   "dependencies": {
-    "bcryptjs":       "^2.4.3",
-    "better-sqlite3": "^9.4.3",
-    "cookie":         "^0.6.0",
-    "express":        "^4.18.2",
-    "jsonwebtoken":   "^9.0.2",
-    "socket.io":      "^4.7.4"
+    "bcryptjs":        "^2.4.3",
+    "better-sqlite3":  "^9.4.3",
+    "cookie":          "^0.6.0",
+    "express":         "^4.18.2",
+    "jsonwebtoken":    "^9.0.2",
+    "socket.io":       "^4.7.4",
+    "socket.io-client":"^4.7.4"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

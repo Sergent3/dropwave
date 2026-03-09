@@ -5,14 +5,10 @@ const http       = require('http');
 const { Server } = require('socket.io');
 const path       = require('path');
 const fs         = require('fs');
-const crypto     = require('crypto');
 const bcrypt     = require('bcryptjs');
 const jwt        = require('jsonwebtoken');
 const cookie     = require('cookie');
 const Database   = require('better-sqlite3');
-
-// Genera un token monouso crittograficamente sicuro (32 byte hex = 64 char)
-const genPeerToken = () => crypto.randomBytes(32).toString('hex');
 
 // ── Config ────────────────────────────────────────────────────────────────
 const PORT       = process.env.PORT       || 3000;
@@ -37,7 +33,7 @@ db.exec(`
   )
 `);
 
-// ── Helpers ───────────────────────────────────────────────────────────────
+// ── JWT helpers ───────────────────────────────────────────────────────────
 function signToken(user) {
   return jwt.sign({ sub: user.id, username: user.username }, JWT_SECRET, { expiresIn: JWT_TTL });
 }
@@ -81,7 +77,10 @@ app.post('/api/auth/register', async (req, res) => {
 
     const user  = { id: info.lastInsertRowid, username: username.trim() };
     const token = signToken(user);
-    res.cookie(COOKIE, token, cookieOpts).status(201).json({ ok: true, username: user.username });
+    // token nel body: usato dai client CLI; httpOnly cookie: usato dai browser
+    res.cookie(COOKIE, token, cookieOpts)
+       .status(201)
+       .json({ ok: true, username: user.username, token });
   } catch (e) {
     if (e.code === 'SQLITE_CONSTRAINT_UNIQUE')
       return res.status(409).json({ error: 'Email già registrata.' });
@@ -100,7 +99,9 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(401).json({ error: 'Email o password errati.' });
 
   const token = signToken(user);
-  res.cookie(COOKIE, token, cookieOpts).json({ ok: true, username: user.username });
+  // token nel body per CLI, cookie per browser
+  res.cookie(COOKIE, token, cookieOpts)
+     .json({ ok: true, username: user.username, token });
 });
 
 app.post('/api/auth/logout', (_, res) => {
@@ -119,17 +120,18 @@ app.get('/health', (_, res) => res.json({ status: 'ok', rooms: rooms.size }));
 // ── Socket.io ─────────────────────────────────────────────────────────────
 const io = new Server(server);
 
-// Auth middleware — runs before every connection
+// Auth middleware: browser invia cookie httpOnly, CLI invia token in handshake.auth
 io.use((socket, next) => {
-  const raw     = cookie.parse(socket.handshake.headers.cookie || '')[COOKIE];
-  const payload = verifyToken(raw);
+  const fromCookie = cookie.parse(socket.handshake.headers.cookie || '')[COOKIE];
+  const fromAuth   = socket.handshake.auth?.token;
+  const payload    = verifyToken(fromCookie) || verifyToken(fromAuth);
   if (!payload) return next(new Error('AUTH_REQUIRED'));
   socket.data.userId   = payload.sub;
   socket.data.username = payload.username;
   next();
 });
 
-// Rooms: roomId → { sender: {socketId, username, token}, receiver?: {socketId, username, token} }
+// Rooms: roomId → { sender: {socketId, username}, receiver?: {socketId, username} }
 const rooms = new Map();
 
 io.on('connection', (socket) => {
@@ -137,51 +139,47 @@ io.on('connection', (socket) => {
 
   socket.on('create-room', (roomId) => {
     if (rooms.has(roomId)) { socket.emit('room-error', 'Stanza già esistente. Riprova.'); return; }
-
-    // Genera il token monouso del sender
-    const senderToken = genPeerToken();
     rooms.set(roomId, {
-      sender: { socketId: socket.id, username: socket.data.username, token: senderToken },
+      sender: { socketId: socket.id, username: socket.data.username },
     });
     socket.join(roomId);
     socket.data.roomId = roomId;
-
-    // Il sender riceve solo il suo token (non sa ancora chi arriverà)
-    socket.emit('room-created', roomId, senderToken);
+    socket.emit('room-created', roomId);
     console.log(`[R] created: ${roomId} by ${socket.data.username}`);
   });
 
   socket.on('join-room', (roomId) => {
     const room = rooms.get(roomId);
-    if (!room)          { socket.emit('room-error', 'Stanza non trovata. Controlla il codice.'); return; }
-    if (room.receiver)  { socket.emit('room-error', 'Stanza piena (max 2 partecipanti).'); return; }
+    if (!room)         { socket.emit('room-error', 'Stanza non trovata. Controlla il codice.'); return; }
+    if (room.receiver) { socket.emit('room-error', 'Stanza piena (max 2 partecipanti).'); return; }
 
-    // Genera il token monouso del receiver
-    const receiverToken = genPeerToken();
-    room.receiver = { socketId: socket.id, username: socket.data.username, token: receiverToken };
+    room.receiver = { socketId: socket.id, username: socket.data.username };
     socket.join(roomId);
     socket.data.roomId = roomId;
-
-    // Il receiver riceve: il suo token + il token atteso del sender (per verificarlo sul DC)
-    socket.emit('room-joined', roomId, receiverToken, room.sender.token);
-
-    // Il sender riceve: username del peer + token atteso del receiver (per verificarlo sul DC)
-    socket.to(roomId).emit('peer-joined', {
-      username:      socket.data.username,
-      expectedToken: receiverToken,   // il sender dovrà ricevere questo dal DC
-    });
+    socket.emit('room-joined', roomId);
+    socket.to(roomId).emit('peer-joined', { username: socket.data.username });
     console.log(`[R] joined: ${roomId} by ${socket.data.username}`);
   });
 
-  // WebRTC signaling — pure relay
-  socket.on('offer',         ({ roomId, offer })     => socket.to(roomId).emit('offer', offer));
-  socket.on('answer',        ({ roomId, answer })    => socket.to(roomId).emit('answer', answer));
-  socket.on('ice-candidate', ({ roomId, candidate }) => socket.to(roomId).emit('ice-candidate', candidate));
+  // ── Relay — il server è un puro corriere, non tocca il contenuto ─────────
+
+  // Messaggi di controllo JSON (file-list, file-start, file-end, xfer-done)
+  socket.on('relay-ctrl', (msg) => {
+    if (!socket.data.roomId) return;
+    socket.to(socket.data.roomId).emit('relay-ctrl', msg);
+  });
+
+  // Chunk binari (Buffer dal CLI, ArrayBuffer dal browser)
+  socket.on('relay-chunk', (chunk, ack) => {
+    if (!socket.data.roomId) return;
+    socket.to(socket.data.roomId).emit('relay-chunk', chunk);
+    if (typeof ack === 'function') ack(); // conferma al CLI sender
+  });
 
   socket.on('disconnect', () => {
     const roomId = socket.data.roomId;
     if (roomId && rooms.has(roomId)) {
-      rooms.delete(roomId);   // elimina anche i token monouso
+      rooms.delete(roomId);
       socket.to(roomId).emit('peer-disconnected');
       console.log(`[-] Room ${roomId} closed`);
     }
@@ -191,5 +189,5 @@ io.on('connection', (socket) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🌊  DropWave v2  —  http://0.0.0.0:${PORT}\n`);
+  console.log(`\n🌊  DropWave v3  —  http://0.0.0.0:${PORT}\n`);
 });
