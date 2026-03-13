@@ -46,6 +46,7 @@ if (!TOKEN) {
 function isAllowed(p) {
   var resolved = path.resolve(p);
   return ALLOWED_PATHS.some(function(allowed) {
+    if (allowed === path.sep) return true;
     return resolved === allowed || resolved.startsWith(allowed + path.sep);
   });
 }
@@ -271,14 +272,6 @@ async function transferFiles(socket, filePaths, jobId) {
   var totalBytes = fileMeta.reduce(function(s, f) { return s + f.size; }, 0);
   console.log('File da inviare: ' + fileMeta.length + ' (' + fmtBytes(totalBytes) + ')');
 
-  // Pre-calcola hash
-  console.log('Calcolo SHA-256...');
-  var hashes = [];
-  for (var hi = 0; hi < filePaths.length; hi++) {
-    hashes.push(await hashFile(filePaths[hi]));
-    console.log('  ✓ ' + fileMeta[hi].name);
-  }
-
   socket.emit('relay-ctrl', {
     type: 'file-list',
     files: fileMeta.map(function(f) { return { name: f.name, size: f.size, type: f.type }; }),
@@ -302,32 +295,35 @@ async function transferFiles(socket, filePaths, jobId) {
     socket.emit('relay-ctrl', {
       type: 'file-start', index: i,
       name: meta.name, size: meta.size, fileType: meta.type,
-      sha256: hashes[i],
     });
 
     console.log('Invio [' + (i+1) + '/' + filePaths.length + ']: ' + meta.name);
 
     var bytesDoneBefore = fileMeta.slice(0, i).reduce(function(s, f) { return s + f.size; }, 0);
-    await sendChunks(socket, fp, meta, i, startOffset, bytesDoneBefore, totalBytes, jobId);
+    // SHA-256 calcolato in streaming durante l'invio (nessuna doppia lettura)
+    var hash = await sendChunks(socket, fp, meta, i, startOffset, bytesDoneBefore, totalBytes, jobId);
 
     process.stdout.write('\n');
-    socket.emit('relay-ctrl', { type: 'file-end', index: i, sha256: hashes[i] });
-    console.log('  ✓ ' + meta.name);
+    console.log('  ✓ ' + meta.name + ' [SHA: ' + hash.substring(0, 12) + '...]');
+    socket.emit('relay-ctrl', { type: 'file-end', index: i, sha256: hash });
   }
 
   socket.emit('relay-ctrl', { type: 'xfer-done' });
 }
 
+// Restituisce il SHA-256 del file calcolato in streaming durante l'invio
 async function sendChunks(socket, fp, meta, fileIndex, startOffset, bytesDoneBefore, totalBytes, jobId) {
   var inFlight  = 0;
   var bytesSent = startOffset;
   var chunkCnt  = 0;
+  var hasher    = crypto.createHash('sha256');
 
   for await (var chunk of readChunks(fp, startOffset)) {
     while (inFlight >= MAX_IN_FLIGHT) {
       await new Promise(function(r) { setImmediate(r); });
     }
     inFlight++;
+    hasher.update(chunk);
     socket.emit('relay-chunk', chunk, function() { inFlight--; });
     bytesSent += chunk.length;
     chunkCnt++;
@@ -351,6 +347,8 @@ async function sendChunks(socket, fp, meta, fileIndex, startOffset, bytesDoneBef
   while (inFlight > 0) {
     await new Promise(function(r) { setImmediate(r); });
   }
+
+  return hasher.digest('hex');
 }
 
 // ── Transfer: receiver ────────────────────────────────────────────────────
@@ -406,10 +404,10 @@ function startReceiving(socket, outputDir, jobId) {
         var idx = msg.index;
         if (rx.hashers[idx] && rx.currentFile) {
           var computed = rx.hashers[idx].digest('hex');
-          var expected = rx.currentFile.sha256 || null;
+          var expected = msg.sha256 || null;  // sha256 è in file-end (calcolato in streaming dal sender)
           var ok = expected ? (computed === expected) : null;
           if (ok === true)  console.log('  ✓ SHA-256 OK');
-          if (ok === false) console.log('  ✗ SHA-256 FAIL!');
+          if (ok === false) console.log('  ✗ SHA-256 FAIL! atteso=' + (expected && expected.substring(0,12)) + ' ricevuto=' + computed.substring(0,12));
           socket.emit('device-integrity-report', {
             jobId: rx.jobId, filename: rx.currentFile.name, sha256: computed,
           });
@@ -462,15 +460,9 @@ socket.on('connect_error', function(err) {
   console.log('Riconnessione in corso...');
 });
 
-socket.on('reconnect', function(n) {
-  console.log('Riconnesso (tentativo ' + n + ')');
-  sessionActive = false;
-});
-
 socket.on('connect', function() {
-  if (sessionActive) return;
+  sessionActive = false;
   socket.emit('register-device', { isAgent: true, label: LABEL });
-  socket.emit('report-local-addrs', []); // aggiornato dopo
   console.log('[' + new Date().toLocaleTimeString() + '] Connesso come: ' + LABEL);
 });
 

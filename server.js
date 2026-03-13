@@ -157,7 +157,15 @@ function requireAuth(req, res, next) {
 // ── REST API trasferimenti ─────────────────────────────────────────────────
 app.get('/api/transfers', requireAuth, function(req, res) {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const rows  = db.prepare('SELECT * FROM transfers ORDER BY created_at DESC LIMIT ?').all(limit);
+  const rows  = db.prepare(`
+    SELECT t.*,
+           su.username AS sender_username,
+           ru.username AS receiver_username
+    FROM transfers t
+    LEFT JOIN users su ON su.id = t.sender_user_id
+    LEFT JOIN users ru ON ru.id = t.receiver_user_id
+    ORDER BY t.created_at DESC LIMIT ?
+  `).all(limit);
   res.json(rows.map(function(r) { return Object.assign({}, r, { file_manifest: JSON.parse(r.file_manifest || '[]') }); }));
 });
 
@@ -183,6 +191,20 @@ app.patch('/api/transfers/:jobId', requireAuth, function(req, res) {
   res.status(400).json({ error: 'Azione non supportata' });
 });
 
+app.delete('/api/transfers/:jobId', requireAuth, function(req, res) {
+  var jobId = req.params.jobId;
+  db.prepare('DELETE FROM transfer_integrity WHERE job_id = ?').run(jobId);
+  var result = db.prepare('DELETE FROM transfers WHERE job_id = ?').run(jobId);
+  if (!result.changes) return res.status(404).json({ error: 'Job non trovato' });
+  res.json({ ok: true });
+});
+
+app.delete('/api/transfers', requireAuth, function(req, res) {
+  db.prepare('DELETE FROM transfer_integrity').run();
+  db.prepare('DELETE FROM transfers').run();
+  res.json({ ok: true });
+});
+
 // ── Socket.io ─────────────────────────────────────────────────────────────
 const io = new Server(server);
 
@@ -200,10 +222,30 @@ io.use((socket, next) => {
 // ── Stato globale ─────────────────────────────────────────────────────────
 // devices:  socketId → { socketId, username, ip, status, connectedAt }
 // rooms:    roomId   → { sender: {socketId, username}, receiver: {socketId, username} }
-const devices     = new Map();
-const rooms       = new Map();
-const userSockets = new Map(); // userId → Set<socketId>
+const devices          = new Map();
+const rooms            = new Map();
+const userSockets      = new Map(); // userId → Set<socketId>
+const pendingReceivers = new Map(); // senderSocketId → { receiverSock, data, timer }
 const fsPendingRequests = new Map(); // reqId → adminSocketId
+
+// ── LAN direct: sender-first session pairing ──────────────────────────────
+// Sends session-ready to sender first; when sender reports local-addrs (HTTP port),
+// forwards session-ready to receiver with senderLocalAddrs. Falls back to relay after 3s.
+function sendSessionReadyPair(senderSock, senderData, receiverSock, receiverData) {
+  senderSock.emit('session-ready', senderData);
+
+  var fallbackTimer = setTimeout(function() {
+    pendingReceivers.delete(senderSock.id);
+    receiverData.senderLocalAddrs = null;
+    receiverSock.emit('session-ready', receiverData);
+  }, 3000);
+
+  pendingReceivers.set(senderSock.id, {
+    receiverSock:  receiverSock,
+    receiverData:  receiverData,
+    timer:         fallbackTimer,
+  });
+}
 
 // ── Scheduler ─────────────────────────────────────────────────────────────
 let schedulerTimer = null;
@@ -255,8 +297,12 @@ function dispatchJob(jobId) {
   if (devices.has(job.receiver_socket_id)) devices.get(job.receiver_socket_id).status = 'in-session';
   broadcastDevices();
 
-  senderSocket.emit('session-ready',   { role: 'sender',   roomId: roomId, peerUsername: receiverSocket.data.username, jobId: jobId });
-  receiverSocket.emit('session-ready', { role: 'receiver', roomId: roomId, peerUsername: senderSocket.data.username,   jobId: jobId });
+  sendSessionReadyPair(
+    senderSocket,
+    { role: 'sender',   roomId: roomId, peerUsername: receiverSocket.data.username, jobId: jobId },
+    receiverSocket,
+    { role: 'receiver', roomId: roomId, peerUsername: senderSocket.data.username,   jobId: jobId }
+  );
 
   io.to('_admins').emit('server-transfer-started', {
     jobId: jobId, roomId: roomId,
@@ -318,10 +364,19 @@ io.on('connection', (socket) => {
     console.log('[D] Device: ' + socket.data.username + (data.isAgent ? ' [agent]' : '') + ' (' + ip + ')');
   });
 
-  // ── Device riporta i suoi indirizzi locali (CLI) ─────────────────────────
-  socket.on('report-local-addrs', (addrs) => {
+  // ── Device riporta i suoi indirizzi locali (HTTP server avviato) ──────────
+  socket.on('report-local-addrs', function(addrs) {
     const dev = devices.get(socket.id);
     if (dev) dev.localAddrs = addrs;
+
+    // Se c'è un receiver in attesa per questo sender, mandagli session-ready ora
+    if (pendingReceivers.has(socket.id)) {
+      var pending = pendingReceivers.get(socket.id);
+      clearTimeout(pending.timer);
+      pendingReceivers.delete(socket.id);
+      pending.receiverData.senderLocalAddrs = addrs;
+      pending.receiverSock.emit('session-ready', pending.receiverData);
+    }
   });
 
   // ── Admin crea sessione ─────────────────────────────────────────────────
@@ -356,20 +411,12 @@ io.on('connection', (socket) => {
     if (devices.has(receiverSocketId)) devices.get(receiverSocketId).status = 'in-session';
     broadcastDevices();
 
-    // Indirizzi locali del sender (per direct transfer su LAN)
-    const senderLocalAddrs = devices.has(senderSocketId)
-      ? devices.get(senderSocketId).localAddrs
-      : null;
-
-    // Notifica i dispositivi del loro ruolo
-    senderSock.emit('session-ready', {
-      role: 'sender', roomId, peerUsername: receiverSock.data.username,
-    });
-    receiverSock.emit('session-ready', {
-      role: 'receiver', roomId,
-      peerUsername:    senderSock.data.username,
-      senderLocalAddrs,   // null se il sender non ha riportato indirizzi locali
-    });
+    sendSessionReadyPair(
+      senderSock,
+      { role: 'sender',   roomId, peerUsername: receiverSock.data.username },
+      receiverSock,
+      { role: 'receiver', roomId, peerUsername: senderSock.data.username }
+    );
 
     // Notifica l'admin del successo
     socket.emit('session-created', {
@@ -544,16 +591,12 @@ io.on('connection', (socket) => {
         .run(jobId, senderSock.data.userId || 0, senderSocketId, receiverSock.data.userId || 0, receiverSocketId, JSON.stringify(filePaths.map(function(fp) { return { path: fp }; })));
     } catch(e) { /* ignora errori DB */ }
 
-    senderSock.emit('session-ready', {
-      role: 'sender', roomId, jobId,
-      peerUsername: receiverSock.data.username,
-      filePaths: filePaths,
-    });
-    receiverSock.emit('session-ready', {
-      role: 'receiver', roomId, jobId,
-      peerUsername: senderSock.data.username,
-      outputPath: outputPath,
-    });
+    sendSessionReadyPair(
+      senderSock,
+      { role: 'sender',   roomId, jobId, peerUsername: receiverSock.data.username, filePaths: filePaths },
+      receiverSock,
+      { role: 'receiver', roomId, jobId, peerUsername: senderSock.data.username,   outputPath: outputPath }
+    );
 
     socket.emit('session-created', {
       roomId, jobId,
@@ -642,6 +685,9 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🌊  DropWave v5  —  http://0.0.0.0:${PORT}`);
   console.log(`   Admin panel:  http://0.0.0.0:${PORT}/`);
   console.log(`   Device page:  http://0.0.0.0:${PORT}/device\n`);
+  // Segna come failed i transfer "running" orfani (rimasti dal crash/restart precedente)
+  const orphans = db.prepare("UPDATE transfers SET status='failed', error_msg='Server riavviato', finished_at=unixepoch() WHERE status='running'").run();
+  if (orphans.changes > 0) console.log('[!] Marcati ' + orphans.changes + ' transfer orfani come failed');
   // Avvia scheduler per job già in coda dal DB (sopravvissuti al restart)
   scheduleNext();
 });

@@ -430,15 +430,6 @@ async function transferFiles(socket, filePaths, jobId) {
   console.log('File da inviare: ' + fileMeta.length + ' (' + fmtBytes(totalBytes) + ' totali)');
   fileMeta.forEach(function(f, i) { console.log('  [' + (i+1) + '] ' + f.name + ' — ' + fmtBytes(f.size)); });
 
-  // Pre-calcola hash SHA-256
-  console.log('\nCalcolo SHA-256...');
-  var hashes = [];
-  for (var hi = 0; hi < filePaths.length; hi++) {
-    hashes.push(await hashFile(filePaths[hi]));
-    console.log('  v ' + fileMeta[hi].name + ': ' + hashes[hi].substring(0, 16) + '...');
-  }
-  console.log('');
-
   socket.emit('relay-ctrl', { type: 'file-list', files: fileMeta });
 
   // Aspetta max 2 secondi un eventuale resume-info dal receiver
@@ -463,18 +454,17 @@ async function transferFiles(socket, filePaths, jobId) {
     socket.emit('relay-ctrl', {
       type: 'file-start', index: i,
       name: meta.name, size: meta.size, fileType: meta.type,
-      sha256: hashes[i],
     });
 
     console.log('Invio [' + (i+1) + '/' + filePaths.length + ']: ' + meta.name +
       (startOffset > 0 ? ' (resume da ' + fmtBytes(startOffset) + ')' : ''));
 
     var bytesDoneBefore = fileMeta.slice(0, i).reduce(function(s, f) { return s + f.size; }, 0);
-    await sendChunks(socket, fp, meta, i, startOffset, bytesDoneBefore, totalBytes, fileMeta, jobId);
+    var hash = await sendChunks(socket, fp, meta, i, startOffset, bytesDoneBefore, totalBytes, fileMeta, jobId);
 
     process.stdout.write('\n');
-    socket.emit('relay-ctrl', { type: 'file-end', index: i, sha256: hashes[i] });
-    console.log('  v ' + meta.name + ' [SHA: ' + hashes[i].substring(0, 12) + '...]\n');
+    socket.emit('relay-ctrl', { type: 'file-end', index: i, sha256: hash });
+    console.log('  v ' + meta.name + ' [SHA: ' + hash.substring(0, 12) + '...]\n');
   }
 
   socket.emit('relay-ctrl', { type: 'xfer-done' });
@@ -484,6 +474,7 @@ async function sendChunks(socket, fp, meta, fileIndex, startOffset, bytesDoneBef
   let inFlight  = 0;
   let bytesSent = startOffset;
   let chunkCount = 0;
+  const hasher = crypto.createHash('sha256');
 
   for await (const chunk of readChunks(fp, startOffset)) {
     // Backpressure: aspetta che l'ack del server riduca i chunk in volo
@@ -492,6 +483,7 @@ async function sendChunks(socket, fp, meta, fileIndex, startOffset, bytesDoneBef
     }
 
     inFlight++;
+    hasher.update(chunk);
     socket.emit('relay-chunk', chunk, () => { inFlight--; });
 
     bytesSent += chunk.length;
@@ -529,6 +521,8 @@ async function sendChunks(socket, fp, meta, fileIndex, startOffset, bytesDoneBef
   while (inFlight > 0) {
     await new Promise(r => setImmediate(r));
   }
+
+  return hasher.digest('hex');
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -733,6 +727,49 @@ async function cmdDevice(flags, filePaths) {
     console.log('Connesso — in attesa di istruzioni dall\'admin…');
   });
 
+  // ── Filesystem browsing (richieste dall'admin) ──────────────────────────
+  socket.on('fs-get-roots', function(data) {
+    var roots = [];
+    if (process.platform === 'win32') {
+      for (var c = 65; c <= 90; c++) {
+        var d = String.fromCharCode(c) + ':\\';
+        try { fs.accessSync(d); roots.push({ name: d, path: d, type: 'dir' }); } catch(e) {}
+      }
+    } else {
+      roots.push({ name: '/', path: '/', type: 'dir' });
+      var home = os.homedir();
+      if (home !== '/') roots.push({ name: home, path: home, type: 'dir' });
+    }
+    socket.emit('fs-roots-result', { reqId: data.reqId, roots: roots });
+  });
+
+  socket.on('fs-list-dir', function(data) {
+    try {
+      var entries = fs.readdirSync(data.path, { withFileTypes: true });
+      var result  = [];
+      var parent  = path.dirname(data.path);
+      if (parent !== data.path) result.push({ name: '..', path: parent, type: 'parent', size: null });
+      entries.sort(function(a, b) {
+        if (a.isDirectory() && !b.isDirectory()) return -1;
+        if (!a.isDirectory() && b.isDirectory()) return 1;
+        return a.name.localeCompare(b.name);
+      });
+      entries.forEach(function(e) {
+        if (e.name.startsWith('.')) return;
+        try {
+          var fullPath = path.join(data.path, e.name);
+          var isDir    = e.isDirectory();
+          var size     = null;
+          if (!isDir) size = fs.statSync(fullPath).size;
+          result.push({ name: e.name, path: fullPath, type: isDir ? 'dir' : 'file', size: size });
+        } catch(err) {}
+      });
+      socket.emit('fs-list-result', { reqId: data.reqId, path: data.path, entries: result });
+    } catch(err) {
+      socket.emit('fs-list-result', { reqId: data.reqId, path: data.path, entries: [], error: err.message });
+    }
+  });
+
   socket.on('session-ready', async function(data) {
     const role             = data.role;
     const roomId           = data.roomId;
@@ -850,7 +887,7 @@ function startReceiving(socket, outputDir, jobId) {
         var idx = msg.index;
         if (rx.hashers[idx] && rx.currentFile) {
           var computedHash = rx.hashers[idx].digest('hex');
-          var expectedHash = rx.currentFile.sha256 || null;
+          var expectedHash = msg.sha256 || null;
           var integrityOk  = expectedHash ? (computedHash === expectedHash) : null;
 
           if (integrityOk === true)  console.log('  v SHA-256 OK: ' + computedHash.substring(0, 16) + '...');

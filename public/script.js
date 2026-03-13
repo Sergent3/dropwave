@@ -219,7 +219,11 @@
     sk.on('session-created', function(data) {
       var roomId = data.roomId, sender = data.sender, receiver = data.receiver;
       showSuccess('Sessione ' + roomId + ': ' + sender + ' → ' + receiver);
-      addActiveSession(roomId, sender, receiver);
+      addActiveSession(roomId, sender, receiver, data.jobId || null);
+      // Aggiungi alla coda se è un trasferimento agent (ha jobId)
+      if (data.jobId) {
+        addQueueItem({ jobId: data.jobId, status: 'running', sender: sender, receiver: receiver, scheduledAt: null });
+      }
       S.selectedSender     = null;
       S.selectedReceiver   = null;
       S.selectedFiles      = [];
@@ -270,13 +274,16 @@
     });
     sk.on('server-transfer-done', function(data) {
       updateQueueItem(data.jobId, 'done');
+      removeActiveSession(data.jobId);
     });
     sk.on('server-transfer-failed', function(data) {
       updateQueueItem(data.jobId, 'failed');
+      removeActiveSession(data.jobId);
       showError('Trasferimento fallito: ' + (data.error || data.jobId));
     });
     sk.on('server-transfer-cancelled', function(data) {
       updateQueueItem(data.jobId, 'cancelled');
+      removeActiveSession(data.jobId);
     });
 
     // ── Integrity ─────────────────────────────────────────────────────────
@@ -376,13 +383,13 @@
     const receiverDev = S.lastDevices.find(d => d.socketId === S.selectedReceiver);
 
     if (senderVal) {
-      senderVal.textContent = senderDev ? senderDev.username : 'Nessuno selezionato';
+      senderVal.textContent = senderDev ? (senderDev.label || senderDev.username) : 'Nessuno selezionato';
       senderVal.className   = `slot-value${senderDev ? '' : ' empty'}`;
     }
     if (slotSender) slotSender.className = `session-slot${senderDev ? ' filled-sender' : ''}`;
 
     if (receiverVal) {
-      receiverVal.textContent = receiverDev ? receiverDev.username : 'Nessuno selezionato';
+      receiverVal.textContent = receiverDev ? (receiverDev.label || receiverDev.username) : 'Nessuno selezionato';
       receiverVal.className   = `slot-value${receiverDev ? '' : ' empty'}`;
     }
     if (slotRcv) slotRcv.className = `session-slot${receiverDev ? ' filled-receiver' : ''}`;
@@ -393,7 +400,7 @@
     updateAgentTransferBtn();
   }
 
-  function addActiveSession(roomId, sender, receiver) {
+  function addActiveSession(roomId, sender, receiver, jobId) {
     const block = $('active-sessions-block');
     const list  = $('sessions-list');
     if (block) block.classList.remove('hidden');
@@ -405,17 +412,34 @@
     const item = document.createElement('div');
     item.className = 'session-item';
     item.dataset.room = roomId;
-    item.innerHTML = `
-      <span class="session-room">${esc(roomId)}</span>
-      <span class="session-peers">
-        ${esc(sender)} <span class="arrow">→</span> ${esc(receiver)}
-      </span>
-      <span style="font-size:12px;color:var(--muted)">${new Date().toLocaleTimeString()}</span>
-      <div class="si-progress">
-        <div class="si-pbar-wrap"><div class="si-pbar"></div></div>
-        <span class="si-pct">0%</span>
-      </div>`;
+    if (jobId) item.dataset.jobId = jobId;
+    item.innerHTML =
+      '<span class="session-room">' + esc(roomId) + '</span>' +
+      '<span class="session-peers">' + esc(sender) + '<span class="arrow">→</span>' + esc(receiver) + '</span>' +
+      '<div style="display:flex;align-items:center;gap:8px">' +
+        '<span style="font-size:12px;color:var(--muted)">' + new Date().toLocaleTimeString() + '</span>' +
+        (jobId ? '<button class="btn btn-ghost" style="color:var(--error);font-size:12px;padding:2px 8px" onclick="cancelTransfer(\'' + esc(jobId) + '\')">■ Stop</button>' : '') +
+      '</div>' +
+      '<div class="si-progress">' +
+        '<div class="si-pbar-wrap"><div class="si-pbar"></div></div>' +
+        '<span class="si-pct">0%</span>' +
+      '</div>';
     list.insertBefore(item, list.firstChild);
+  }
+
+  function removeActiveSession(jobId) {
+    if (!jobId) return;
+    var item = document.querySelector('.session-item[data-job-id="' + jobId + '"]');
+    if (!item) return;
+    item.remove();
+    var list  = $('sessions-list');
+    var block = $('active-sessions-block');
+    var cnt   = $('sessions-count');
+    if (list && block) {
+      var remaining = list.querySelectorAll('.session-item').length;
+      if (remaining === 0) block.classList.add('hidden');
+      if (cnt) cnt.textContent = remaining;
+    }
   }
 
   function updateSessionProgress(data) {
@@ -425,7 +449,7 @@
       const barEl = item.querySelector('.si-pbar');
       const pctEl = item.querySelector('.si-pct');
       if (barEl) barEl.style.width = pct.toFixed(1) + '%';
-      if (pctEl) pctEl.textContent = pct.toFixed(1) + '% — ' + fmtBytes(data.totalDone) + ' / ' + fmtBytes(data.totalSize);
+      if (pctEl) pctEl.textContent = (data.fileName ? esc(data.fileName) + ' — ' : '') + pct.toFixed(1) + '% — ' + fmtBytes(data.totalDone) + ' / ' + fmtBytes(data.totalSize);
     }
     // Aggiorna queue-item se esiste un jobId
     if (data.jobId) {
@@ -433,7 +457,7 @@
       var qbar = $('qp-' + data.jobId);
       var qpct = $('qpct-' + data.jobId);
       if (qbar) qbar.style.width = pct2.toFixed(1) + '%';
-      if (qpct) qpct.textContent = pct2.toFixed(1) + '%';
+      if (qpct) qpct.textContent = (data.fileName ? esc(data.fileName) + ' — ' : '') + pct2.toFixed(1) + '%';
     }
   }
 
@@ -554,6 +578,14 @@
     if (empty) empty.classList.add('hidden');
     if (!list) return;
 
+    // Se l'item esiste già, aggiorna solo lo stato
+    var existing = $('qi-' + data.jobId);
+    if (existing) {
+      var badge = existing.querySelector('.qi-status');
+      if (badge && data.status) { badge.className = 'qi-status ' + data.status; badge.textContent = statusLabel(data.status); }
+      return;
+    }
+
     var item = document.createElement('div');
     item.className = 'queue-item';
     item.id = 'qi-' + data.jobId;
@@ -571,7 +603,8 @@
       '<div class="qi-footer">' +
         '<span class="qi-time">' + (data.scheduledAt ? 'Pianificato: ' + new Date(data.scheduledAt).toLocaleString() : 'Immediato') + '</span>' +
         '<div class="qi-actions">' +
-          '<button class="btn btn-ghost" onclick="cancelTransfer(\'' + esc(data.jobId) + '\')">✕ Cancella</button>' +
+          (data.status === 'queued' || data.status === 'running' ? '<button class="btn btn-ghost" onclick="cancelTransfer(\'' + esc(data.jobId) + '\')">■ Stop</button>' : '') +
+          '<button class="btn btn-ghost" style="color:var(--error)" onclick="deleteTransfer(\'' + esc(data.jobId) + '\')">🗑 Elimina</button>' +
         '</div>' +
       '</div>';
     list.insertBefore(item, list.firstChild);
@@ -611,8 +644,8 @@
           addQueueItem({
             jobId:       row.job_id,
             status:      row.status,
-            sender:      row.sender_socket_id || '—',
-            receiver:    row.receiver_socket_id || '—',
+            sender:      row.sender_username || row.sender_socket_id || '—',
+            receiver:    row.receiver_username || row.receiver_socket_id || '—',
             scheduledAt: row.scheduled_at ? row.scheduled_at * 1000 : null,
           });
         });
@@ -962,8 +995,11 @@
     S.fbMode     = mode;
     S.fbDeviceId = deviceSocketId;
     S.fbCurrentPath  = null;
-    S.fbSelectedFiles = [];
-    S.fbSelectedDir   = null;
+    S.fbSelectedFiles = (mode === 'sender' && S.selectedFiles && S.selectedFiles.length)
+      ? S.selectedFiles.slice() : [];
+    S.fbSelectedDir = (mode === 'receiver' && S.selectedOutputPath)
+      ? { path: S.selectedOutputPath, name: S.selectedOutputPath.split('/').pop() || S.selectedOutputPath }
+      : null;
 
     var dev = S.lastDevices.find(function(d) { return d.socketId === deviceSocketId; });
     $('fb-title').textContent = mode === 'sender'
@@ -1151,6 +1187,29 @@
   window.cancelTransfer = function(jobId) {
     if (!S.socket) return;
     S.socket.emit('admin-cancel-transfer', { jobId: jobId });
+  };
+
+  window.deleteTransfer = async function(jobId) {
+    try {
+      var res = await fetch('/api/transfers/' + encodeURIComponent(jobId), { method: 'DELETE', credentials: 'same-origin' });
+      if (!res.ok) { showError('Errore eliminazione: ' + res.status); return; }
+      var item = $('qi-' + jobId);
+      if (item) item.remove();
+      var list = $('queue-list');
+      if (list && !list.querySelector('.queue-item')) {
+        list.innerHTML = '<div class="queue-empty">Nessun trasferimento registrato.</div>';
+      }
+    } catch(e) { showError('Errore durante l\'eliminazione.'); }
+  };
+
+  window.deleteAllTransfers = async function() {
+    if (!confirm('Eliminare tutta la cronologia dei trasferimenti?')) return;
+    try {
+      var res = await fetch('/api/transfers', { method: 'DELETE', credentials: 'same-origin' });
+      if (!res.ok) { showError('Errore eliminazione: ' + res.status); return; }
+      var list = $('queue-list');
+      if (list) list.innerHTML = '<div class="queue-empty">Nessun trasferimento registrato.</div>';
+    } catch(e) { showError('Errore durante l\'eliminazione.'); }
   };
 
 })();

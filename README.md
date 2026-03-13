@@ -1,21 +1,40 @@
 # 🌊 DropWave
 
-**Trasferimento file P2P direttamente tra browser, senza toccare il server.**
+Sistema di trasferimento file P2P con pannello admin web, agent daemon persistente e CLI.
+Il server funge da relay WebSocket e da centro di controllo — i file transitano attraverso di esso oppure direttamente via LAN.
 
-DropWave usa WebRTC DataChannel per connettere due peer in modo diretto e cifrato (DTLS). Il server Node.js funge esclusivamente da **signaling server** e da **notaio di autenticazione** — nessun byte dei file viene mai caricato su di esso.
+---
+
+## Architettura
+
+```
+[Admin Panel (browser)]  ──┐
+                           ├──▶  [Server]  ◀──▶  [Agent / CLI / Device browser]
+[Device (browser / CLI)]  ──┘
+```
+
+| Componente | Descrizione |
+|---|---|
+| `server.js` | Server centrale — Express + Socket.io, auth JWT, DB SQLite |
+| `agent.js` | Daemon persistente installabile su qualsiasi macchina Linux |
+| `client.js` | CLI interattiva — login, send, receive, device mode |
+| `public/` | SPA — pannello admin + modalità device browser |
+| `install.sh` | Installer agent (systemd / OpenRC / nohup) |
 
 ---
 
 ## Funzionalità
 
-- **P2P puro** — i file viaggiano direttamente tra i due browser via WebRTC DataChannel
-- **Autenticazione a 3 livelli** — JWT per il server, token monouso per il canale P2P, handshake mutuo sul DataChannel
-- **File grandi** — chunking a 16 KB con backpressure, supporta file da 1 GB+
-- **Liste di file** — invio sequenziale di più file con progress bar individuale e totale
-- **Download automatico** — ogni file viene scaricato non appena ricevuto, senza aspettare la fine
-- **Velocità in tempo reale** — MB/s aggiornato durante il trasferimento
-- **Link diretto** — genera un URL `?join=CODICE` da condividere al destinatario
-- **UI dark moderna** — Inter font, glassmorphism, orbs animati, avatar dropdown
+- **Pannello admin web** — seleziona mittente e ricevente tra i dispositivi connessi, avvia trasferimenti, sfoglia il filesystem remoto
+- **Agent daemon** — si installa con un comando, riconnessione automatica, controllabile da remoto
+- **LAN direct transfer** — se i due device sono sulla stessa rete il file viaggia direttamente via HTTP (senza passare dal server relay); fallback automatico al relay
+- **Transfer scheduling** — pianifica trasferimenti a data/ora futura; sopravvivono al restart del server
+- **SHA-256 streaming** — hash calcolato durante l'invio senza doppia lettura del file; verifica lato receiver con report al server
+- **Resume trasferimenti** — file parziali ripresi dall'offset corretto
+- **Filesystem browser** — l'admin sfoglia il filesystem di qualsiasi device/agent connesso
+- **Coda e cronologia** — tutti i job sono tracciati nel DB con stato, progresso e integrità
+- **CLI multi-comando** — `login`, `device`, `send`, `receive`
+- **Autenticazione** — JWT httpOnly cookie (browser) + token nell'handshake Socket.io (CLI/agent)
 
 ---
 
@@ -23,27 +42,14 @@ DropWave usa WebRTC DataChannel per connettere due peer in modo diretto e cifrat
 
 | Layer | Tecnologia |
 |---|---|
-| Signaling server | Node.js + Express + Socket.io |
-| Database utenti | SQLite via `better-sqlite3` |
-| Autenticazione | JWT (httpOnly cookie, 7 giorni) + bcrypt (12 round) |
-| Trasferimento | WebRTC DataChannel (DTLS cifrato) |
+| Server | Node.js + Express + Socket.io |
+| Database | SQLite via `better-sqlite3` |
+| Autenticazione | JWT + bcrypt (12 round) |
+| Trasferimento relay | Socket.io binary chunks (256 KB, backpressure 8 in-flight) |
+| Trasferimento diretto | HTTP chunked con Range support (resume) |
+| Integrità | SHA-256 streaming (crypto Node.js built-in) |
 | Frontend | HTML5 / CSS3 / JavaScript vanilla |
 | Container | Docker + Docker Compose |
-
----
-
-## Come funziona l'autenticazione
-
-```
-1. Entrambi i peer fanno login → ricevono un JWT in httpOnly cookie
-2. Il server valida il JWT su ogni connessione Socket.io
-3. Alla creazione/join della stanza, il server genera token monouso
-   e li distribuisce via canale Socket.io (già autenticato)
-4. Quando il DataChannel WebRTC apre, i peer si scambiano i token
-   e verificano l'identità dell'altro prima di accettare qualsiasi file
-```
-
-Un peer non autenticato o con token errato viene disconnesso immediatamente.
 
 ---
 
@@ -55,30 +61,88 @@ Un peer non autenticato o con token errato viene disconnesso immediatamente.
 git clone https://github.com/Sergent3/dropwave.git
 cd dropwave
 npm install
-JWT_SECRET=un-segreto-lungo-e-random npm start
+JWT_SECRET=cambia-questo-in-produzione node server.js
 # → http://localhost:3000
 ```
 
 ### Docker
 
 ```bash
-cp .env.example .env
-# Modifica .env: imposta JWT_SECRET con una stringa casuale sicura
 docker compose up --build
 # → http://localhost:3000
 ```
 
-> **Nota:** Su reti diverse con NAT simmetrico, aggiungere un server TURN alla configurazione ICE in `public/script.js` per garantire la connettività.
-
----
-
-## Variabili d'ambiente
+### Variabili d'ambiente
 
 | Variabile | Descrizione | Default |
 |---|---|---|
-| `JWT_SECRET` | Chiave di firma JWT — **obbligatoria in produzione** | stringa di sviluppo |
+| `JWT_SECRET` | Chiave firma JWT — **obbligatoria in produzione** | stringa di sviluppo |
 | `PORT` | Porta del server | `3000` |
 | `DB_PATH` | Percorso del file SQLite | `./data/users.db` |
+
+---
+
+## Installazione agent su un device remoto
+
+```bash
+curl http://<SERVER>/install.sh | bash
+# oppure, per preservare stdin:
+bash <(curl -s http://<SERVER>/install.sh)
+```
+
+Lo script:
+1. Verifica / installa Node.js
+2. Scarica `agent.js` dal server
+3. Chiede le credenziali e salva il token in `~/.dropwave/agent.json`
+4. Registra il servizio (systemd root → systemd user → OpenRC → nohup)
+
+Il device compare automaticamente nel pannello admin.
+
+**Config agent** (`~/.dropwave/agent.json`):
+
+```json
+{
+  "server": "http://<SERVER>",
+  "token": "<JWT>",
+  "label": "nome-macchina",
+  "allowedPaths": ["/"]
+}
+```
+
+---
+
+## CLI
+
+```bash
+# Autenticazione (salva token in ~/.dropwave/token)
+node client.js login
+
+# Modalità device — controllabile dall'admin
+node client.js device --server http://<SERVER> [--output ~/Downloads] [file1 file2 ...]
+
+# Invio diretto con codice stanza (v3)
+node client.js send --server http://<SERVER> --room XXXX file.zip
+
+# Ricezione diretta con codice stanza (v3)
+node client.js receive --server http://<SERVER> --room XXXX --output ./cartella
+```
+
+---
+
+## Flusso trasferimento agent-driven
+
+```
+Admin sfoglia il filesystem del sender → seleziona file
+Admin sfoglia il filesystem del receiver → seleziona cartella destinazione
+Admin clicca 🚀 Trasferisci
+  └▶ server crea roomId + jobId, notifica entrambi i device
+       ├▶ sender avvia HTTP server locale, riporta IP:porta
+       └▶ receiver tenta connessione diretta LAN
+            ├▶ successo → download HTTP diretto (resume supportato)
+            └▶ fallback → relay WebSocket
+  └▶ receiver calcola SHA-256, invia report al server
+  └▶ job marcato "done" nel DB
+```
 
 ---
 
@@ -86,25 +150,33 @@ docker compose up --build
 
 ```
 dropwave/
-├── server.js          # Signaling server, auth REST API, Socket.io
+├── server.js          # Server centrale, REST API, Socket.io relay
+├── agent.js           # Daemon device — filesystem browser, sender/receiver
+├── client.js          # CLI — login, send, receive, device mode
+├── install.sh         # Installer agent
 ├── public/
-│   ├── index.html     # SPA — UI con auth, sender, receiver
-│   └── script.js      # WebRTC, chunking, handshake P2P
+│   ├── index.html     # SPA admin panel + device mode
+│   └── script.js      # UI, file browser, relay sender/receiver
 ├── Dockerfile
 ├── docker-compose.yml
-├── .env.example
 └── package.json
 ```
 
 ---
 
-## Flusso di utilizzo
+## API REST
 
-1. **Mittente** → *Crea Sessione* → condivide il codice a 6 caratteri (o il link diretto)
-2. **Destinatario** → inserisce il codice → *Unisciti*
-3. Handshake WebRTC automatico + verifica token mutua
-4. Mittente trascina i file → *Avvia Trasferimento*
-5. Il destinatario vede il progresso e scarica ogni file automaticamente al termine
+| Metodo | Endpoint | Descrizione |
+|---|---|---|
+| `POST` | `/api/auth/register` | Registrazione |
+| `POST` | `/api/auth/login` | Login (imposta cookie JWT) |
+| `POST` | `/api/auth/logout` | Logout |
+| `GET` | `/api/auth/me` | Utente corrente |
+| `GET` | `/api/transfers` | Lista trasferimenti |
+| `PATCH` | `/api/transfers/:jobId` | Cancella / ripianifica job |
+| `DELETE` | `/api/transfers/:jobId` | Elimina job dalla cronologia |
+| `DELETE` | `/api/transfers` | Elimina tutta la cronologia |
+| `GET` | `/health` | Status server |
 
 ---
 
