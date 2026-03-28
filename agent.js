@@ -17,6 +17,7 @@ const net      = require('net');
 const crypto   = require('crypto');
 
 const CONFIG_FILE = path.join(os.homedir(), '.dropwave', 'agent.json');
+const PID_FILE    = path.join(os.homedir(), '.dropwave', 'agent.pid');
 const CHUNK_SIZE  = 256 * 1024;
 const MAX_IN_FLIGHT = 8;
 
@@ -41,6 +42,20 @@ if (!TOKEN) {
   console.error('Token mancante nella config. Reinstalla l\'agent.');
   process.exit(1);
 }
+
+// ── Istanza unica (PID file) ───────────────────────────────────────────────
+try {
+  var existingPid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+  if (existingPid && existingPid !== process.pid) {
+    try {
+      process.kill(existingPid, 0); // segnale 0 = solo check esistenza
+      console.error('Agent già in esecuzione (PID ' + existingPid + '). Uscita.');
+      process.exit(1);
+    } catch(e) { /* processo non esiste più, PID file stale */ }
+  }
+} catch(e) { /* PID file non esiste */ }
+fs.writeFileSync(PID_FILE, String(process.pid));
+process.on('exit', function() { try { fs.unlinkSync(PID_FILE); } catch(e) {} });
 
 // ── Filesystem browser ────────────────────────────────────────────────────
 function isAllowed(p) {
@@ -305,7 +320,7 @@ async function transferFiles(socket, filePaths, jobId) {
 
     process.stdout.write('\n');
     console.log('  ✓ ' + meta.name + ' [SHA: ' + hash.substring(0, 12) + '...]');
-    socket.emit('relay-ctrl', { type: 'file-end', index: i, sha256: hash });
+    socket.emit('relay-ctrl', { type: 'file-end', index: i, name: meta.name, sha256: hash });
   }
 
   socket.emit('relay-ctrl', { type: 'xfer-done' });
@@ -319,6 +334,7 @@ async function sendChunks(socket, fp, meta, fileIndex, startOffset, bytesDoneBef
   var hasher    = crypto.createHash('sha256');
 
   for await (var chunk of readChunks(fp, startOffset)) {
+    if (!sessionActive) break;
     while (inFlight >= MAX_IN_FLIGHT) {
       await new Promise(function(r) { setImmediate(r); });
     }
@@ -419,7 +435,8 @@ function startReceiving(socket, outputDir, jobId) {
       }
       case 'xfer-done': {
         console.log('✓ Completato. ' + rx.filesDone + ' file in: ' + outputDir);
-        socket.disconnect(); process.exit(0);
+        socket.disconnect();
+        setTimeout(function() { socket.connect(); }, 1000);
         break;
       }
     }
@@ -491,15 +508,24 @@ socket.on('session-ready', async function(data) {
   console.log('\n[' + new Date().toLocaleTimeString() + '] Sessione ' + roomId + ' — ' + role.toUpperCase() + ' (peer: ' + peerUsername + ')');
 
   if (role === 'sender') {
+    console.log('  filePaths ricevuti: ' + JSON.stringify(filePaths));
     if (!filePaths.length) {
       console.error('Nessun file specificato per il sender. Sessione annullata.');
-      socket.disconnect(); return;
+      sessionActive = false;
+      socket.disconnect();
+      setTimeout(function() { socket.connect(); }, 1000);
+      return;
     }
     // Verifica file
     for (var i = 0; i < filePaths.length; i++) {
-      if (!fs.existsSync(filePaths[i])) {
+      var exists = fs.existsSync(filePaths[i]);
+      console.log('  [check] ' + filePaths[i] + ' → ' + (exists ? 'OK' : 'NON TROVATO'));
+      if (!exists) {
         console.error('File non trovato: ' + filePaths[i]);
-        socket.disconnect(); return;
+        sessionActive = false;
+        socket.disconnect();
+        setTimeout(function() { socket.connect(); }, 1000);
+        return;
       }
     }
 
@@ -523,10 +549,11 @@ socket.on('session-ready', async function(data) {
   } else {
     // receiver
     var outDir = outputPath || os.homedir();
+    console.log('  outputPath: ' + (outputPath || '(null → ' + outDir + ')'));
     fs.mkdirSync(outDir, { recursive: true });
 
     if (senderLocalAddrs && senderLocalAddrs.length) {
-      console.log('  Provo connessione diretta LAN...');
+      console.log('  Provo connessione diretta LAN (' + senderLocalAddrs.map(function(a){return a.ip+':'+a.port;}).join(', ') + ')...');
       var ok = await tryDirectDownload(senderLocalAddrs, outDir, socket, jobId);
       if (ok) {
         sessionActive = false;
@@ -535,6 +562,8 @@ socket.on('session-ready', async function(data) {
         return;
       }
       console.log('  Connessione diretta non riuscita — relay.');
+    } else {
+      console.log('  Nessun indirizzo LAN ricevuto — relay diretto.');
     }
 
     console.log('In attesa file via relay in: ' + outDir);
@@ -570,6 +599,8 @@ async function tryDirectDownload(addrs, outputDir, sock, jobId) {
       console.log('  ✓ ' + f.name);
     }
     console.log('✓ Completato in: ' + outputDir);
+    sock.emit('relay-ctrl', { type: 'xfer-done' });
+    await new Promise(function(r) { setTimeout(r, 500); });
     return true;
   } catch(err) {
     console.error('Errore direct download: ' + err.message);

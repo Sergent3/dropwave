@@ -23,6 +23,8 @@ fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+// Migrazione idempotente: aggiunge output_path se non esiste
+try { db.exec('ALTER TABLE transfers ADD COLUMN output_path TEXT'); } catch(e) {}
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,8 +269,9 @@ function dispatchJob(jobId) {
   const job = db.prepare('SELECT * FROM transfers WHERE job_id = ?').get(jobId);
   if (!job || job.status !== 'queued') return;
 
-  const senderSocket   = job.sender_socket_id ? io.sockets.sockets.get(job.sender_socket_id) : null;
-  const receiverSocket = job.receiver_socket_id ? io.sockets.sockets.get(job.receiver_socket_id) : null;
+  // Bug fix: usa findActiveSocket per risolvere socket ID aggiornati dopo riconnessioni
+  const senderSocket   = findActiveSocket(job.sender_user_id,   job.sender_socket_id);
+  const receiverSocket = findActiveSocket(job.receiver_user_id, job.receiver_socket_id);
 
   if (!senderSocket || !receiverSocket) {
     db.prepare("UPDATE transfers SET status='failed', error_msg=?, finished_at=unixepoch() WHERE job_id=?")
@@ -277,14 +280,16 @@ function dispatchJob(jobId) {
     return;
   }
 
-  const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+  const roomId     = Math.random().toString(36).substring(2, 8).toUpperCase();
+  const filePaths  = JSON.parse(job.file_manifest || '[]');
+  const outputPath = job.output_path || null;
 
-  db.prepare("UPDATE transfers SET status='running', started_at=unixepoch(), room_id=? WHERE job_id=?")
-    .run(roomId, jobId);
+  db.prepare("UPDATE transfers SET status='running', started_at=unixepoch(), room_id=?, sender_socket_id=?, receiver_socket_id=? WHERE job_id=?")
+    .run(roomId, senderSocket.id, receiverSocket.id, jobId);
 
   rooms.set(roomId, {
-    sender:   { socketId: job.sender_socket_id,   username: senderSocket.data.username },
-    receiver: { socketId: job.receiver_socket_id, username: receiverSocket.data.username },
+    sender:   { socketId: senderSocket.id,   username: senderSocket.data.username },
+    receiver: { socketId: receiverSocket.id, username: receiverSocket.data.username },
     jobId: jobId,
   });
 
@@ -293,16 +298,16 @@ function dispatchJob(jobId) {
   senderSocket.data.roomId   = roomId;
   receiverSocket.data.roomId = roomId;
 
-  if (devices.has(job.sender_socket_id))   devices.get(job.sender_socket_id).status   = 'in-session';
-  if (devices.has(job.receiver_socket_id)) devices.get(job.receiver_socket_id).status = 'in-session';
+  if (devices.has(senderSocket.id))   devices.get(senderSocket.id).status   = 'in-session';
+  if (devices.has(receiverSocket.id)) devices.get(receiverSocket.id).status = 'in-session';
   broadcastDevices();
 
-  sendSessionReadyPair(
-    senderSocket,
-    { role: 'sender',   roomId: roomId, peerUsername: receiverSocket.data.username, jobId: jobId },
-    receiverSocket,
-    { role: 'receiver', roomId: roomId, peerUsername: senderSocket.data.username,   jobId: jobId }
-  );
+  const senderData   = { role: 'sender',   roomId: roomId, peerUsername: receiverSocket.data.username, jobId: jobId };
+  const receiverData = { role: 'receiver', roomId: roomId, peerUsername: senderSocket.data.username,   jobId: jobId };
+  if (filePaths.length) senderData.filePaths     = filePaths;
+  if (outputPath)       receiverData.outputPath   = outputPath;
+
+  sendSessionReadyPair(senderSocket, senderData, receiverSocket, receiverData);
 
   io.to('_admins').emit('server-transfer-started', {
     jobId: jobId, roomId: roomId,
@@ -329,6 +334,23 @@ function devicesSnapshot() {
 // Notifica tutti gli admin della lista aggiornata
 function broadcastDevices() {
   io.to('_admins').emit('devices-update', devicesSnapshot());
+}
+
+// Trova il socket attivo per un utente: prima prova il socketId preferito (salvato nel DB),
+// poi cerca qualsiasi socket attivo dello stesso userId (utile dopo riconnessioni).
+function findActiveSocket(userId, preferredSocketId) {
+  if (preferredSocketId) {
+    const sock = io.sockets.sockets.get(preferredSocketId);
+    if (sock) return sock;
+  }
+  const socketIds = userSockets.get(String(userId));
+  if (socketIds) {
+    for (const sid of socketIds) {
+      const sock = io.sockets.sockets.get(sid);
+      if (sock && devices.has(sid)) return sock;
+    }
+  }
+  return null;
 }
 
 // ── Connessione ───────────────────────────────────────────────────────────
@@ -392,6 +414,11 @@ io.on('connection', (socket) => {
       socket.emit('admin-error', 'Mittente e ricevente devono essere dispositivi diversi.');
       return;
     }
+    const senderDev = devices.get(senderSocketId);
+    if (senderDev && senderDev.isAgent) {
+      socket.emit('admin-error', 'Per inviare file da un agent usa il file browser e "Avvia Trasferimento Agent".');
+      return;
+    }
 
     // Genera roomId e crea la stanza direttamente lato server
     const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -433,6 +460,8 @@ io.on('connection', (socket) => {
     var senderSocketId   = data.senderSocketId;
     var receiverSocketId = data.receiverSocketId;
     var scheduledAt      = data.scheduledAt;
+    var filePaths        = data.filePaths  || [];
+    var outputPath       = data.outputPath || null;
     var senderSock   = io.sockets.sockets.get(senderSocketId);
     var receiverSock = io.sockets.sockets.get(receiverSocketId);
     if (!senderSock || !receiverSock) {
@@ -443,8 +472,8 @@ io.on('connection', (socket) => {
     var jobId = Math.random().toString(36).substring(2, 12).toUpperCase();
     var scheduledTs = scheduledAt ? Math.floor(new Date(scheduledAt).getTime() / 1000) : Math.floor(Date.now() / 1000);
 
-    db.prepare('INSERT INTO transfers (job_id, sender_user_id, sender_socket_id, receiver_user_id, receiver_socket_id, status, scheduled_at) VALUES (?, ?, ?, ?, ?, \'queued\', ?)')
-      .run(jobId, senderSock.data.userId || 0, senderSocketId, receiverSock.data.userId || 0, receiverSocketId, scheduledTs);
+    db.prepare('INSERT INTO transfers (job_id, sender_user_id, sender_socket_id, receiver_user_id, receiver_socket_id, file_manifest, output_path, status, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, ?, \'queued\', ?)')
+      .run(jobId, senderSock.data.userId || 0, senderSocketId, receiverSock.data.userId || 0, receiverSocketId, JSON.stringify(filePaths), outputPath, scheduledTs);
 
     io.to('_admins').emit('server-transfer-queued', {
       jobId: jobId,
@@ -495,15 +524,10 @@ io.on('connection', (socket) => {
     io.to('_admins').emit('server-integrity-result', {
       jobId:       jobId,
       filename:    filename,
-      ok:          ok === 1,
+      ok:          ok === null ? null : ok === 1,
       expectedSha: expected ? expected.expected_sha : null,
       receivedSha: sha256,
     });
-
-    if (ok !== null) {
-      db.prepare("UPDATE transfers SET status='done', finished_at=unixepoch() WHERE job_id=? AND status='running'")
-        .run(jobId);
-    }
   });
 
   // ── Filesystem browsing (admin → device → admin) ──────────────────────────
@@ -570,6 +594,12 @@ io.on('connection', (socket) => {
     var roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
     var jobId  = Math.random().toString(36).substring(2, 12).toUpperCase();
 
+    var senderIp   = devices.get(senderSocketId)?.ip   || '?';
+    var receiverIp = devices.get(receiverSocketId)?.ip || '?';
+    console.log('[T] ' + jobId + ' sender=' + senderSock.data.username + '@' + senderIp + ' receiver=' + receiverSock.data.username + '@' + receiverIp);
+    console.log('[T] filePaths: ' + JSON.stringify(filePaths));
+    console.log('[T] outputPath: ' + outputPath);
+
     rooms.set(roomId, {
       sender:   { socketId: senderSocketId,   username: senderSock.data.username },
       receiver: { socketId: receiverSocketId, username: receiverSock.data.username },
@@ -587,8 +617,8 @@ io.on('connection', (socket) => {
 
     // Salva job nel DB
     try {
-      db.prepare('INSERT INTO transfers (job_id, sender_user_id, sender_socket_id, receiver_user_id, receiver_socket_id, file_manifest, status, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, \'running\', unixepoch())')
-        .run(jobId, senderSock.data.userId || 0, senderSocketId, receiverSock.data.userId || 0, receiverSocketId, JSON.stringify(filePaths.map(function(fp) { return { path: fp }; })));
+      db.prepare('INSERT INTO transfers (job_id, sender_user_id, sender_socket_id, receiver_user_id, receiver_socket_id, file_manifest, status, room_id, started_at) VALUES (?, ?, ?, ?, ?, ?, \'running\', ?, unixepoch())')
+        .run(jobId, senderSock.data.userId || 0, senderSocketId, receiverSock.data.userId || 0, receiverSocketId, JSON.stringify(filePaths.map(function(fp) { return { path: fp }; })), roomId);
     } catch(e) { /* ignora errori DB */ }
 
     sendSessionReadyPair(
@@ -617,8 +647,17 @@ io.on('connection', (socket) => {
   socket.on('relay-ctrl', function(msg) {
     if (!socket.data.roomId) return;
 
-    // Cattura sha256 dal sender per verificarla dopo
-    if (msg.type === 'file-start' && msg.sha256) {
+    // Aggiorna file_manifest con i nomi reali dei file al momento del trasferimento
+    if (msg.type === 'file-list' && Array.isArray(msg.files)) {
+      var roomFL = rooms.get(socket.data.roomId);
+      if (roomFL && roomFL.jobId) {
+        db.prepare('UPDATE transfers SET file_manifest=? WHERE job_id=?')
+          .run(JSON.stringify(msg.files.map(function(f) { return { name: f.name, size: f.size }; })), roomFL.jobId);
+      }
+    }
+
+    // Cattura sha256 dal sender (in file-end, calcolato in streaming)
+    if (msg.type === 'file-end' && msg.sha256 && msg.name) {
       var room = rooms.get(socket.data.roomId);
       if (room && room.jobId) {
         db.prepare('INSERT OR REPLACE INTO transfer_integrity (job_id, filename, expected_sha) VALUES (?, ?, ?)')
@@ -630,7 +669,7 @@ io.on('connection', (socket) => {
     if (msg.type === 'xfer-done') {
       var room2 = rooms.get(socket.data.roomId);
       if (room2 && room2.jobId) {
-        db.prepare("UPDATE transfers SET status='done', finished_at=unixepoch() WHERE job_id=? AND status='running'")
+        db.prepare("UPDATE transfers SET status='done', finished_at=unixepoch() WHERE job_id=? AND status IN ('running','failed')")
           .run(room2.jobId);
         io.to('_admins').emit('server-transfer-done', { jobId: room2.jobId });
       }

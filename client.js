@@ -463,7 +463,7 @@ async function transferFiles(socket, filePaths, jobId) {
     var hash = await sendChunks(socket, fp, meta, i, startOffset, bytesDoneBefore, totalBytes, fileMeta, jobId);
 
     process.stdout.write('\n');
-    socket.emit('relay-ctrl', { type: 'file-end', index: i, sha256: hash });
+    socket.emit('relay-ctrl', { type: 'file-end', index: i, name: meta.name, sha256: hash });
     console.log('  v ' + meta.name + ' [SHA: ' + hash.substring(0, 12) + '...]\n');
   }
 

@@ -620,8 +620,16 @@
   function updateIntegrityBadge(jobId, ok) {
     var badge = $('qi-int-' + jobId);
     if (!badge) return;
-    badge.className = 'integrity-badge ' + (ok ? 'integrity-ok' : 'integrity-fail');
-    badge.textContent = ok ? 'v SHA-256' : 'x SHA-256';
+    if (ok === null || ok === undefined) {
+      badge.className = 'integrity-badge integrity-pending';
+      badge.textContent = 'SHA-256';
+    } else if (ok) {
+      badge.className = 'integrity-badge integrity-ok';
+      badge.textContent = '✓ SHA-256';
+    } else {
+      badge.className = 'integrity-badge integrity-fail';
+      badge.textContent = '✗ SHA-256';
+    }
   }
 
   function statusLabel(s) {

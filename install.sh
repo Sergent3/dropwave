@@ -48,8 +48,8 @@ echo "✓ Dipendenze installate"
 # Login
 echo ""
 echo "Credenziali DropWave (account esistente o nuovo):"
-read -p "Email: " DW_EMAIL
-read -s -p "Password: " DW_PASSWORD
+read -p "Email: " DW_EMAIL </dev/tty
+read -s -p "Password: " DW_PASSWORD </dev/tty
 echo ""
 
 RESPONSE=$(curl -s -X POST "$SERVER/api/auth/login" \
@@ -67,11 +67,7 @@ fi
 echo "✓ Autenticato come: $USERNAME"
 
 # Allowed paths
-ALLOWED="\"$HOME\""
-[ -d "/media" ]      && ALLOWED="$ALLOWED,\"/media\""
-[ -d "/mnt" ]        && ALLOWED="$ALLOWED,\"/mnt\""
-[ -d "/home/movie" ] && ALLOWED="$ALLOWED,\"/home/movie\""
-[ -d "/data" ]       && ALLOWED="$ALLOWED,\"/data\""
+ALLOWED="\"/\""
 
 HOSTNAME_LABEL=$(hostname)
 
@@ -115,6 +111,10 @@ pidfile=\"/run/dropwave-agent.pid\"
 output_log=\"/var/log/dropwave-agent.log\"
 error_log=\"/var/log/dropwave-agent.log\""
 
+# Termina qualsiasi istanza precedente prima di avviare
+pkill -f "node.*agent.js" 2>/dev/null || true
+sleep 1
+
 if [ "$(id -u)" = "0" ] && command -v systemctl &>/dev/null; then
   echo "$SYSTEMD_UNIT" > /etc/systemd/system/dropwave-agent.service
   systemctl daemon-reload
@@ -141,8 +141,7 @@ elif [ "$(id -u)" = "0" ] && command -v rc-update &>/dev/null; then
   echo "✓ Servizio OpenRC avviato"
 
 else
-  # Fallback: nohup
-  pkill -f "node $AGENT_JS" 2>/dev/null || true
+  # Fallback: nohup (pkill già fatto sopra)
   nohup node "$AGENT_JS" > "$INSTALL_DIR/agent.log" 2>&1 &
   echo "✓ Agent avviato (background, PID: $!)"
   echo "  Log: tail -f $INSTALL_DIR/agent.log"
