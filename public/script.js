@@ -155,7 +155,7 @@
   }
 
   function connectSocket() {
-    S.socket = io({ reconnectionAttempts: 5 });
+    S.socket = io({ reconnectionAttempts: 5, transports: ['websocket'] });
 
     S.socket.on('connect', () => {
       if (MODE === 'admin') {

@@ -1,27 +1,11 @@
-# ── Stage 1: Build native modules (needs python3/make/g++ for better-sqlite3) ─
-FROM node:20-alpine AS deps
+FROM node:20-slim
 WORKDIR /app
 
-RUN apk add --no-cache python3 make g++
+RUN apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev && rm -rf /var/lib/apt/lists/*
 
-COPY package*.json ./
-RUN npm ci --omit=dev
+COPY server.js agent.js client.js install.sh ./
+COPY public/ ./public/
 
-# ── Stage 2: Lean runtime image ───────────────────────────────────────────────
-FROM node:20-alpine
-WORKDIR /app
-
-# libsqlite3 is needed at runtime by the compiled better-sqlite3 addon
-RUN apk add --no-cache sqlite-libs
-
-# Copy compiled node_modules (includes better-sqlite3 .node binary)
-COPY --from=deps /app/node_modules ./node_modules
-
-# App source
-COPY server.js ./
-COPY public/   ./public/
-
-# Persistent data directory for SQLite DB
 RUN mkdir -p /app/data && chown node:node /app/data
 
 ENV NODE_ENV=production
